@@ -10,10 +10,12 @@
 #include <assert.h>
 
 #include <float.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/types.h>
 
 #include <cilktool.h>
+#include <csi.h>
 
 #include "cilkprof_stack.h"
 #include "iaddrs.h"
@@ -150,22 +152,6 @@ uint64_t measure_and_add_strand_length(cilkprof_stack_t *stack) {
 }
 
 /*************************************************************************/
-
-void cilk_tool_init(void) {
-  // Do the initialization only if it hasn't been done. 
-  // It could have been done if we instrument C functions, and the user 
-  // separately calls cilk_tool_init in the main function.
-  if(!TOOL_INITIALIZED) {
-    WHEN_TRACE_CALLS( fprintf(stderr, "cilk_tool_init() [ret %p]\n",
-                              __builtin_extract_return_addr(__builtin_return_address(0))); );
-
-    initialize_tool(&GET_STACK(ctx_stack));
-
-    GET_STACK(ctx_stack).in_user_code = true;
-
-    begin_strand(&(GET_STACK(ctx_stack)));
-  }
-}
 
 /* Cleaningup; note that these cleanup may not be performed if
  * the user did not include cilk_tool_destroy in its main function and the
@@ -732,285 +718,6 @@ void cilk_enter_end(__cilkrts_stack_frame *sf, void *rsp)
   begin_strand(stack);
 }
 
-void cilk_tool_c_function_enter(uint32_t prop, void *this_fn, void *rip)
-{
-  cilkprof_stack_t *stack = &(GET_STACK(ctx_stack));
-
-  WHEN_TRACE_CALLS( fprintf(stderr, "c_function_enter(%u, %p, %p) [ret %p]\n", prop, this_fn, rip,
-     __builtin_extract_return_addr(__builtin_return_address(0))); );
-
-  if(!TOOL_INITIALIZED) { // We are entering main.
-    cilk_tool_init(); // this will push the frame for MAIN and do a gettime
-
-    c_fn_frame_t *c_bottom = &(stack->c_stack[stack->c_tail]);
-
-    uintptr_t cs = (uintptr_t)__builtin_extract_return_addr(rip);
-    uintptr_t fn = (uintptr_t)this_fn;
-
-    int32_t cs_index = add_to_iaddr_table(&call_site_table, cs, MAIN);
-    c_bottom->cs_index = cs_index;
-    if (cs_index >= stack->cs_status_capacity) {
-      resize_cs_status_vector(&(stack->cs_status), &(stack->cs_status_capacity));
-    }
-    stack->cs_status[cs_index].c_tail = stack->c_tail;
-    assert(call_site_table->table_size == cs_index + 1);
-    MIN_CAPACITY = cs_index + 1;
-
-    int32_t fn_index = add_to_iaddr_table(&function_table, fn, MAIN);
-    stack->cs_status[cs_index].fn_index = fn_index;
-    /* c_bottom->fn_index = fn_index; */
-    if (fn_index >= stack->fn_status_capacity) {
-      resize_fn_status_vector(&(stack->fn_status), &(stack->fn_status_capacity));
-    }
-    assert(OFF_STACK == stack->fn_status[fn_index]);
-    stack->fn_status[fn_index] = stack->c_tail;
-
-#ifndef NDEBUG
-    c_bottom->rip = (uintptr_t)__builtin_extract_return_addr(rip);
-    c_bottom->function = (uintptr_t)this_fn;
-#endif
-
-#if COMPUTE_STRAND_DATA
-    stack->strand_start
-        = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
-#endif
-  } else {
-    if (!stack->in_user_code) {
-      WHEN_TRACE_CALLS( fprintf(stderr, "c_function_enter(%p) [ret %p]\n", rip,
-                                __builtin_extract_return_addr(__builtin_return_address(0))); );
-    }
-    assert(stack->in_user_code);
-#if COMPUTE_STRAND_DATA
-    stack->strand_end
-        = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
-#endif
-
-    uint64_t strand_len = measure_and_add_strand_length(stack);
-    if (stack->bot->c_head == stack->c_tail) {
-      stack->bot->local_contin += strand_len;
-    }
-
-    // Push new frame for this C function onto the stack
-    /* cilkprof_stack_push(stack, C_FUNCTION); */
-    c_fn_frame_t *c_bottom = cilkprof_c_fn_push(stack);
-
-    uintptr_t cs = (uintptr_t)__builtin_extract_return_addr(rip);
-    uintptr_t fn = (uintptr_t)this_fn;
-
-    int32_t cs_index = add_to_iaddr_table(&call_site_table, cs, C_FUNCTION);
-    c_bottom->cs_index = cs_index;
-    if (cs_index >= stack->cs_status_capacity) {
-      resize_cs_status_vector(&(stack->cs_status), &(stack->cs_status_capacity));
-    }
-    int32_t cs_tail = stack->cs_status[cs_index].c_tail;
-    if (OFF_STACK != cs_tail) {
-      if (!(stack->cs_status[cs_index].flags & RECURSIVE)) {
-        stack->cs_status[cs_index].flags |= RECURSIVE;
-      }
-    } else {
-      int32_t fn_index;
-      if (UNINITIALIZED == stack->cs_status[cs_index].fn_index) {
-
-        assert(call_site_table->table_size == cs_index + 1);
-        MIN_CAPACITY = cs_index + 1;
-
-        fn_index = add_to_iaddr_table(&function_table, fn, C_FUNCTION);
-        stack->cs_status[cs_index].fn_index = fn_index;
-        if (fn_index >= stack->fn_status_capacity) {
-          resize_fn_status_vector(&(stack->fn_status), &(stack->fn_status_capacity));
-        }
-      } else {
-        fn_index = stack->cs_status[cs_index].fn_index;
-      }
-      stack->cs_status[cs_index].c_tail = stack->c_tail;
-      if (OFF_STACK == stack->fn_status[fn_index]) {
-        stack->fn_status[fn_index] = stack->c_tail;
-      }
-    }
-
-    /* fprintf(stderr, "cs_index %d\n", c_bottom->cs_index); */
-
-#ifndef NDEBUG
-    c_bottom->rip = (uintptr_t)__builtin_extract_return_addr(rip);
-    c_bottom->function = (uintptr_t)this_fn;
-#endif
-
-#if COMPUTE_STRAND_DATA
-    stack->strand_start
-        = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
-#endif
-    /* the stop time is also the start time of this function */
-    // stack->start = stack->stop; /* TB: Want to exclude the length
-    // (e.g. time or instruction count) of this function */
-    begin_strand(stack);
-  }
-}
-
-void cilk_tool_c_function_leave(void *rip)
-{
-  WHEN_TRACE_CALLS( fprintf(stderr, "c_function_leave(%p) [ret %p]\n", rip,
-     __builtin_extract_return_addr(__builtin_return_address(0))); );
-
-  cilkprof_stack_t *stack = &(GET_STACK(ctx_stack));
-
-  const c_fn_frame_t *c_bottom = &(stack->c_stack[stack->c_tail]);
-  if (NULL != stack->bot &&
-      MAIN == stack->bot->func_type &&
-      stack->c_tail == stack->bot->c_head) {
-
-    int32_t cs_index = c_bottom->cs_index;
-    int32_t cs_tail = stack->cs_status[cs_index].c_tail;
-    bool top_cs = (cs_tail == stack->c_tail);
-
-    if (top_cs) {
-      stack->cs_status[cs_index].c_tail = OFF_STACK;
-      int32_t fn_index = stack->cs_status[cs_index].fn_index;
-      if (stack->fn_status[fn_index] == stack->c_tail) {
-        stack->fn_status[fn_index] = OFF_STACK;
-      }
-    }
-
-    cilk_tool_destroy();
-  }
-  if (!TOOL_INITIALIZED) {
-    // either user code already called cilk_tool_destroy, or we are leaving
-    // main; in either case, nothing to do here;
-    return;
-  }
-
-  bool add_success;
-  /* cilkprof_stack_frame_t *old_bottom; */
-  const c_fn_frame_t *old_bottom;
-
-  assert(stack->in_user_code);
-  // stop the timer and attribute the elapsed time to this returning
-  // function
-#if COMPUTE_STRAND_DATA
-  stack->strand_end
-      = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
-#endif
-  measure_and_add_strand_length(stack);
-
-  assert(stack->c_tail > stack->bot->c_head);
-  // Given this is a C function, everything should be accumulated in
-  // contin_spn and contin_table, so let's just deposit that into the
-  // parent.
-  /* assert(0 == stack->bot->prefix_spn); */
-  /* assert(0 == stack->bot->local_spn); */
-  /* assert(0 == stack->bot->lchild_spn); */
-/*   assert(cc_hashtable_is_empty(stack->bot->prefix_table)); */
-/*   assert(cc_hashtable_is_empty(stack->bot->lchild_table)); */
-/* #if COMPUTE_STRAND_DATA */
-/*   assert(strand_hashtable_is_empty(stack->bot->strand_prefix_table)); */
-/*   assert(strand_hashtable_is_empty(stack->bot->strand_lchild_table)); */
-/* #endif */
-
-  // Pop the stack
-  old_bottom = cilkprof_c_fn_pop(stack);
-  /* assert(old_bottom->local_wrk == old_bottom->local_contin); */
-  uint64_t local_wrk = old_bottom->local_wrk;
-  uint64_t running_wrk = old_bottom->running_wrk + local_wrk;
-  uint64_t running_spn = old_bottom->running_spn + local_wrk;
-
-  int32_t cs_index = old_bottom->cs_index;
-  int32_t cs_tail = stack->cs_status[cs_index].c_tail;
-  bool top_cs = (cs_tail == stack->c_tail + 1);
-
-  /* fprintf(stderr, "cs_index = %d\n", cs_index); */
-  if (top_cs) {  // top CS instance
-    stack->cs_status[cs_index].c_tail = OFF_STACK;
-    int32_t fn_index = stack->cs_status[cs_index].fn_index;
-    if (stack->fn_status[fn_index] == stack->c_tail + 1) {
-      stack->fn_status[fn_index] = OFF_STACK;
-    }
-  }
-
-  c_fn_frame_t *new_bottom = &(stack->c_stack[stack->c_tail]);
-  new_bottom->running_wrk += running_wrk;
-  new_bottom->running_spn += running_spn;
-
-  // TB: This assert can fail if the compiler does really aggressive
-  // inlining.  See bfs compiled with -O3.
-  /* assert(old_bottom->top_cs || !stack->bot->top_fn); */
-
-  cc_hashtable_t **dst_spn_table;
-  if (0 == stack->bot->lchild_spn) {
-    dst_spn_table = &(stack->bot->prefix_table);
-  } else {
-    dst_spn_table = &(stack->bot->contin_table);
-  }
-
-  assert(NULL != dst_spn_table);
-
-  // Update work table
-  if (top_cs) {
-    uint32_t fn_index = stack->cs_status[new_bottom->cs_index].fn_index;
-    /* fprintf(stderr, "adding to wrk table\n"); */
-    add_success = add_to_cc_hashtable(&(stack->wrk_table),
-                                      stack->c_tail == stack->fn_status[fn_index],
-                                      cs_index,
-#ifndef NDEBUG
-                                      old_bottom->rip,
-#endif
-                                      running_wrk,
-                                      running_spn,
-                                      local_wrk,
-                                      local_wrk);
-    assert(add_success);
-    /* fprintf(stderr, "adding to prefix table\n"); */
-    add_success = add_to_cc_hashtable(dst_spn_table/* &(stack->bot->contin_table) */,
-                                      stack->c_tail == stack->fn_status[fn_index],
-                                      cs_index,
-#ifndef NDEBUG
-                                      old_bottom->rip,
-#endif
-                                      running_wrk,
-                                      running_spn,
-                                      local_wrk,
-                                      local_wrk);
-    assert(add_success);
-  } else {
-    // Only record the local work and local span
-    /* fprintf(stderr, "adding to wrk table\n"); */
-    add_success = add_local_to_cc_hashtable(&(stack->wrk_table),
-                                            cs_index,
-#ifndef NDEBUG
-                                            old_bottom->rip,
-#endif
-                                            local_wrk,
-                                            local_wrk);
-    assert(add_success);
-    /* fprintf(stderr, "adding to contin table\n"); */
-    add_success = add_local_to_cc_hashtable(dst_spn_table/* &(stack->bot->contin_table) */,
-                                            cs_index,
-#ifndef NDEBUG
-                                            old_bottom->rip,
-#endif
-                                            local_wrk,
-                                            local_wrk);
-    assert(add_success);
-  }
-
-/*   // clean up */
-/*   clear_cc_hashtable(old_bottom->prefix_table); */
-/*   clear_cc_hashtable(old_bottom->contin_table); */
-/*   clear_cc_hashtable(old_bottom->lchild_table); */
-/* #if COMPUTE_STRAND_DATA */
-/*   clear_strand_hashtable(old_bottom->strand_prefix_table); */
-/*   clear_strand_hashtable(old_bottom->strand_contin_table); */
-/*   clear_strand_hashtable(old_bottom->strand_lchild_table); */
-/* #endif */
-  /* free(old_bottom); */
-  /* old_bottom->parent = stack->c_fn_free_list; */
-  /* stack->c_fn_free_list = old_bottom; */
-
-#if COMPUTE_STRAND_DATA
-  stack->strand_start
-      = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
-#endif
-  begin_strand(stack);
-}
-
 void cilk_spawn_prepare(__cilkrts_stack_frame *sf)
 {
   WHEN_TRACE_CALLS( fprintf(stderr, "cilk_spawn_prepare(%p) [ret %p]\n", sf,
@@ -1501,6 +1208,349 @@ void cilk_leave_end(void)
       = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
 #endif
   begin_strand(stack);
+}
+
+// Use CSI-instrumentation to keep track of normal C function calls and initialize
+
+void cilk_tool_init(void)
+{
+  // Do the initialization only if it hasn't been done. 
+  if(!TOOL_INITIALIZED) {
+    WHEN_TRACE_CALLS( fprintf(stderr, "cilk_tool_init() [ret %p]\n",
+                              __builtin_extract_return_addr(__builtin_return_address(0))); );
+
+    initialize_tool(&GET_STACK(ctx_stack));
+
+    GET_STACK(ctx_stack).in_user_code = true;
+
+    begin_strand(&(GET_STACK(ctx_stack)));
+  }
+}
+
+void __csi_before_call(const csi_id_t call_id, const csi_id_t func_id,
+                            const csi_prop_t prop)
+{
+  cilkprof_stack_t *stack = &(GET_STACK(ctx_stack));
+
+  if (stack->in_user_code) {
+    source_loc_t const *call_loc = __csi_get_callsite_source_loc(call_id);
+    source_loc_t const *func_loc = __csi_get_func_source_loc(func_id);
+    if (func_loc != NULL && func_id != -1){
+      WHEN_TRACE_CALLS( fprintf(stderr, "__csi_before_call(%ld, %ld) [ret %p] (%s:%d) calling (%s:%d)\n", 
+        call_id, func_id, __builtin_extract_return_addr(__builtin_return_address(0)),
+        call_loc->filename, call_loc->line_number, func_loc->filename, func_loc->line_number); );
+    } else {
+      WHEN_TRACE_CALLS( fprintf(stderr, "__csi_before_call(%ld, %ld) [ret %p] (%s:%d) calling (?:?)\n",
+        call_id, func_id, __builtin_extract_return_addr(__builtin_return_address(0)),
+        func_loc->filename, func_loc->line_number); );
+    }
+  }
+  assert(stack->in_user_code);
+#if COMPUTE_STRAND_DATA
+  stack->strand_end
+      = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+#endif
+
+  uint64_t strand_len = measure_and_add_strand_length(stack);
+  if (stack->bot->c_head == stack->c_tail) {
+    stack->bot->local_contin += strand_len;
+  }
+
+  // Push new frame for this C function onto the stack
+  /* cilkprof_stack_push(stack, C_FUNCTION); */
+  c_fn_frame_t *c_bottom = cilkprof_c_fn_push(stack);
+
+  // We add 1 to the IDs because we can't use 0 as an index into the iaddr table
+  uintptr_t cs = (uintptr_t)call_id + 1;
+  uintptr_t fn = (uintptr_t)func_id + 1;
+
+  if (fn == 0) fn = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+
+  int32_t cs_index = add_to_iaddr_table(&call_site_table, cs, C_FUNCTION);
+  c_bottom->cs_index = cs_index;
+  if (cs_index >= stack->cs_status_capacity) {
+    resize_cs_status_vector(&(stack->cs_status), &(stack->cs_status_capacity));
+  }
+  int32_t cs_tail = stack->cs_status[cs_index].c_tail;
+  if (OFF_STACK != cs_tail) {
+    if (!(stack->cs_status[cs_index].flags & RECURSIVE)) {
+      stack->cs_status[cs_index].flags |= RECURSIVE;
+    }
+  } else {
+    int32_t fn_index;
+    if (UNINITIALIZED == stack->cs_status[cs_index].fn_index) {
+
+      assert(call_site_table->table_size == cs_index + 1);
+      MIN_CAPACITY = cs_index + 1;
+
+      fn_index = add_to_iaddr_table(&function_table, fn, C_FUNCTION);
+      stack->cs_status[cs_index].fn_index = fn_index;
+      if (fn_index >= stack->fn_status_capacity) {
+        resize_fn_status_vector(&(stack->fn_status), &(stack->fn_status_capacity));
+      }
+    } else {
+      fn_index = stack->cs_status[cs_index].fn_index;
+    }
+    stack->cs_status[cs_index].c_tail = stack->c_tail;
+    if (OFF_STACK == stack->fn_status[fn_index]) {
+      stack->fn_status[fn_index] = stack->c_tail;
+    }
+  }
+
+#ifndef NDEBUG
+  c_bottom->rip = (uintptr_t)call_id + 1;
+  c_bottom->function = (uintptr_t)func_id + 1;
+#endif
+
+#if COMPUTE_STRAND_DATA
+  stack->strand_start
+      = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+#endif
+  /* the stop time is also the start time of this function */
+  // stack->start = stack->stop; /* TB: Want to exclude the length
+  // (e.g. time or instruction count) of this function */
+  begin_strand(stack);
+}
+
+void __csi_func_entry(const csi_id_t func_id, const csi_prop_t prop)
+{
+  source_loc_t const *source_loc = __csi_get_func_source_loc(func_id);
+  if (source_loc != NULL && func_id != 1) {
+    WHEN_TRACE_CALLS( fprintf(stderr, "__csi_func_entry(%ld) (%s:%d)\n",
+      func_id, source_loc->filename, source_loc->line_number); );
+  } else {
+    WHEN_TRACE_CALLS( fprintf(stderr, "__csi_func_entry(%ld)\n", func_id); );
+  }
+
+  if(!TOOL_INITIALIZED) { // We are entering main.
+    cilk_tool_init(); // this will push the frame for MAIN and do a gettime
+
+    cilkprof_stack_t *stack = &(GET_STACK(ctx_stack));
+
+    c_fn_frame_t *c_bottom = &(stack->c_stack[stack->c_tail]);
+
+    uintptr_t cs = (uintptr_t)UINT_MAX; // since MAIN has no callsite ID, arbitrarily MAX to avoid collision
+    uintptr_t fn = (uintptr_t)func_id + 1;
+
+    int32_t cs_index = add_to_iaddr_table(&call_site_table, cs, MAIN);
+    c_bottom->cs_index = cs_index;
+    if (cs_index >= stack->cs_status_capacity) {
+      resize_cs_status_vector(&(stack->cs_status), &(stack->cs_status_capacity));
+    }
+    stack->cs_status[cs_index].c_tail = stack->c_tail;
+    assert(call_site_table->table_size == cs_index + 1);
+    MIN_CAPACITY = cs_index + 1;
+
+    int32_t fn_index = add_to_iaddr_table(&function_table, fn, MAIN);
+    stack->cs_status[cs_index].fn_index = fn_index;
+    /* c_bottom->fn_index = fn_index; */
+    if (fn_index >= stack->fn_status_capacity) {
+      resize_fn_status_vector(&(stack->fn_status), &(stack->fn_status_capacity));
+    }
+    assert(OFF_STACK == stack->fn_status[fn_index]);
+    stack->fn_status[fn_index] = stack->c_tail;
+
+#ifndef NDEBUG
+    c_bottom->rip = (uintptr_t)UINT_MAX;
+    c_bottom->function = (uintptr_t)func_id + 1;
+#endif
+
+#if COMPUTE_STRAND_DATA
+    stack->strand_start
+        = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+#endif
+  }
+
+}
+
+void __csi_after_call(const csi_id_t call_id, const csi_id_t func_id,
+                            const csi_prop_t prop)
+{
+  source_loc_t const *call_loc = __csi_get_callsite_source_loc(call_id);
+  source_loc_t const *func_loc = __csi_get_func_source_loc(func_id);
+  if (func_loc != NULL && func_id != -1){
+    WHEN_TRACE_CALLS( fprintf(stderr, "__csi_after_call(%ld, %ld) [ret %p] (%s:%d) calling (%s:%d)\n",
+      call_id, func_id, __builtin_extract_return_addr(__builtin_return_address(0)),
+      call_loc->filename, call_loc->line_number, func_loc->filename, func_loc->line_number); );
+  } else {
+    WHEN_TRACE_CALLS( fprintf(stderr, "__csi_after_call(%ld, %ld) [ret %p] (%s:%d) calling (?:?)\n",
+      call_id, func_id, __builtin_extract_return_addr(__builtin_return_address(0)),
+      call_loc->filename, call_loc->line_number); );
+  }
+
+  if (!TOOL_INITIALIZED) {
+    // either user code already called cilk_tool_destroy, or we left
+    // main; in either case, nothing to do here;
+    return;
+  }
+
+  cilkprof_stack_t *stack = &(GET_STACK(ctx_stack));
+
+  bool add_success;
+  /* cilkprof_stack_frame_t *old_bottom; */
+  const c_fn_frame_t *old_bottom;
+
+  assert(stack->in_user_code);
+  // stop the timer and attribute the elapsed time to this returning
+  // function
+#if COMPUTE_STRAND_DATA
+  stack->strand_end
+      = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+#endif
+  measure_and_add_strand_length(stack);
+
+  assert(stack->c_tail > stack->bot->c_head);
+  // Given this is a C function, everything should be accumulated in
+  // contin_spn and contin_table, so let's just deposit that into the
+  // parent.
+  /* assert(0 == stack->bot->prefix_spn); */
+  /* assert(0 == stack->bot->local_spn); */
+  /* assert(0 == stack->bot->lchild_spn); */
+/*   assert(cc_hashtable_is_empty(stack->bot->prefix_table)); */
+/*   assert(cc_hashtable_is_empty(stack->bot->lchild_table)); */
+/* #if COMPUTE_STRAND_DATA */
+/*   assert(strand_hashtable_is_empty(stack->bot->strand_prefix_table)); */
+/*   assert(strand_hashtable_is_empty(stack->bot->strand_lchild_table)); */
+/* #endif */
+
+  // Pop the stack
+  old_bottom = cilkprof_c_fn_pop(stack);
+  /* assert(old_bottom->local_wrk == old_bottom->local_contin); */
+  uint64_t local_wrk = old_bottom->local_wrk;
+  uint64_t running_wrk = old_bottom->running_wrk + local_wrk;
+  uint64_t running_spn = old_bottom->running_spn + local_wrk;
+
+  int32_t cs_index = old_bottom->cs_index;
+  int32_t cs_tail = stack->cs_status[cs_index].c_tail;
+  bool top_cs = (cs_tail == stack->c_tail + 1);
+
+  /* fprintf(stderr, "cs_index = %d\n", cs_index); */
+  if (top_cs) {  // top CS instance
+    stack->cs_status[cs_index].c_tail = OFF_STACK;
+    int32_t fn_index = stack->cs_status[cs_index].fn_index;
+    if (stack->fn_status[fn_index] == stack->c_tail + 1) {
+      stack->fn_status[fn_index] = OFF_STACK;
+    }
+  }
+
+  c_fn_frame_t *new_bottom = &(stack->c_stack[stack->c_tail]);
+  new_bottom->running_wrk += running_wrk;
+  new_bottom->running_spn += running_spn;
+
+  // TB: This assert can fail if the compiler does really aggressive
+  // inlining.  See bfs compiled with -O3.
+  /* assert(old_bottom->top_cs || !stack->bot->top_fn); */
+
+  cc_hashtable_t **dst_spn_table;
+  if (0 == stack->bot->lchild_spn) {
+    dst_spn_table = &(stack->bot->prefix_table);
+  } else {
+    dst_spn_table = &(stack->bot->contin_table);
+  }
+
+  assert(NULL != dst_spn_table);
+
+  // Update work table
+  if (top_cs) {
+    uint32_t fn_index = stack->cs_status[new_bottom->cs_index].fn_index;
+    /* fprintf(stderr, "adding to wrk table\n"); */
+    add_success = add_to_cc_hashtable(&(stack->wrk_table),
+                                      stack->c_tail == stack->fn_status[fn_index],
+                                      cs_index,
+#ifndef NDEBUG
+                                      old_bottom->rip,
+#endif
+                                      running_wrk,
+                                      running_spn,
+                                      local_wrk,
+                                      local_wrk);
+    assert(add_success);
+    /* fprintf(stderr, "adding to prefix table\n"); */
+    add_success = add_to_cc_hashtable(dst_spn_table/* &(stack->bot->contin_table) */,
+                                      stack->c_tail == stack->fn_status[fn_index],
+                                      cs_index,
+#ifndef NDEBUG
+                                      old_bottom->rip,
+#endif
+                                      running_wrk,
+                                      running_spn,
+                                      local_wrk,
+                                      local_wrk);
+    assert(add_success);
+  } else {
+    // Only record the local work and local span
+    /* fprintf(stderr, "adding to wrk table\n"); */
+    add_success = add_local_to_cc_hashtable(&(stack->wrk_table),
+                                            cs_index,
+#ifndef NDEBUG
+                                            old_bottom->rip,
+#endif
+                                            local_wrk,
+                                            local_wrk);
+    assert(add_success);
+    /* fprintf(stderr, "adding to contin table\n"); */
+    add_success = add_local_to_cc_hashtable(dst_spn_table/* &(stack->bot->contin_table) */,
+                                            cs_index,
+#ifndef NDEBUG
+                                            old_bottom->rip,
+#endif
+                                            local_wrk,
+                                            local_wrk);
+    assert(add_success);
+  }
+
+/*   // clean up */
+/*   clear_cc_hashtable(old_bottom->prefix_table); */
+/*   clear_cc_hashtable(old_bottom->contin_table); */
+/*   clear_cc_hashtable(old_bottom->lchild_table); */
+/* #if COMPUTE_STRAND_DATA */
+/*   clear_strand_hashtable(old_bottom->strand_prefix_table); */
+/*   clear_strand_hashtable(old_bottom->strand_contin_table); */
+/*   clear_strand_hashtable(old_bottom->strand_lchild_table); */
+/* #endif */
+  /* free(old_bottom); */
+  /* old_bottom->parent = stack->c_fn_free_list; */
+  /* stack->c_fn_free_list = old_bottom; */
+
+#if COMPUTE_STRAND_DATA
+  stack->strand_start
+      = (uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0));
+#endif
+  begin_strand(stack);
+}
+
+void __csi_func_exit(const csi_id_t func_exit_id,
+                          const csi_id_t func_id, const csi_prop_t prop)
+{
+  source_loc_t const *source_loc = __csi_get_func_source_loc(func_id);
+  if (source_loc != NULL && func_id != -1) {
+    WHEN_TRACE_CALLS( fprintf(stderr, "__csi_func_exit(%ld) (%s:%d)\n",
+      func_id, source_loc->filename, source_loc->line_number); );
+  } else {
+    WHEN_TRACE_CALLS( fprintf(stderr, "__csi_func_exit(%ld)\n", func_id); );
+  }
+
+  cilkprof_stack_t *stack = &(GET_STACK(ctx_stack));
+
+  const c_fn_frame_t *c_bottom = &(stack->c_stack[stack->c_tail]);
+  if (NULL != stack->bot &&
+      MAIN == stack->bot->func_type &&
+      stack->c_tail == stack->bot->c_head) {
+
+    int32_t cs_index = c_bottom->cs_index;
+    int32_t cs_tail = stack->cs_status[cs_index].c_tail;
+    bool top_cs = (cs_tail == stack->c_tail);
+
+    if (top_cs) {
+      stack->cs_status[cs_index].c_tail = OFF_STACK;
+      int32_t fn_index = stack->cs_status[cs_index].fn_index;
+      if (stack->fn_status[fn_index] == stack->c_tail) {
+        stack->fn_status[fn_index] = OFF_STACK;
+      }
+    }
+
+    cilk_tool_destroy();
+  }
 }
 
 #include "cc_hashtable.c"

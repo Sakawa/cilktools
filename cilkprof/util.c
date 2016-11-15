@@ -8,6 +8,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
+#include <csi.h>
+#include <limits.h>
 
 const char *FunctionType_str[FUNCTIONTYPE_END] = { "empty", "recursive", "main", "INVALID", "cilk", "INVALID", "helper", "INVALID", "c" };
 
@@ -104,6 +106,16 @@ char* get_info_on_inst_addr(uint64_t addr, int *line_no, char **file) {
       return line;
     }
     map_lst_el = map_lst_el->next;
+  }
+
+  // If we don't find the address, check the CSI FED tables
+  source_loc_t const *source_loc = __csi_get_callsite_source_loc(addr + 4);
+  if (source_loc != NULL){
+    *file = source_loc->filename;
+    *line_no = source_loc->line_number;
+    char* line;
+    asprintf(&line, "%s:%d", source_loc->filename, source_loc->line_number);
+    return line;
   }
 
   fprintf(stderr, "address %lx is not in range\n", addr);

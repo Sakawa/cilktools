@@ -2,13 +2,14 @@
 
 COMPILER ?= LLVM
 #COMPILER ?= GCC
+INCLUDE_CSI_DIR = ~/git/Parallel-IR/projects/compiler-rt/lib/csi
 
-CC = gcc
-CXX = g++
+CC = clang
+CXX = clang++
 BASIC_CFLAGS = -O1 -Wall -g
 BASIC_CXXFLAGS = $(BASIC_CFLAGS)
-CFLAGS = $(BASIC_CFLAGS) -std=gnu11 -I $(INCLUDE_DIR)
-CXXFLAGS = $(BASIC_CXXFLAGS) -std=gnu++11 -I $(INCLUDE_DIR)
+CFLAGS = $(BASIC_CFLAGS) -std=gnu11 -I $(INCLUDE_DIR) -I $(INCLUDE_CSI_DIR)
+CXXFLAGS = $(BASIC_CXXFLAGS) -std=gnu++11 -I $(INCLUDE_DIR) -I $(INCLUDE_CSI_DIR)
 LDFLAGS = -L $(LIB_DIR)
 LDLIBS =
 
